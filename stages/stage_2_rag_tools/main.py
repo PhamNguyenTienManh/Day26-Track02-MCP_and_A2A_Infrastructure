@@ -7,6 +7,7 @@ calculate damages — but the orchestration is manual (one tool-call loop).
 
 import asyncio
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -81,6 +82,17 @@ LEGAL_KNOWLEDGE = [
             "public interest (Winter v. Natural Resources Defense Council, 2008)."
         ),
     },
+    {
+        "id": "labor_law",
+        "keywords": ["lao động", "sa thải", "hợp đồng lao động", "labor", "termination"],
+        "text": (
+            "Theo Bộ luật Lao động Việt Nam 2019, người sử dụng lao động có thể "
+            "đơn phương chấm dứt hợp đồng trong các trường hợp: (1) người lao động "
+            "thường xuyên không hoàn thành công việc; (2) bị ốm đau, tai nạn đã điều trị "
+            "12 tháng chưa khỏi; (3) thiên tai, hỏa hoạn; (4) người lao động đủ tuổi nghỉ hưu."
+        ),
+    },
+
 ]
 
 
@@ -91,12 +103,22 @@ LEGAL_KNOWLEDGE = [
 @tool
 def search_legal_database(query: str) -> str:
     """Search the legal knowledge base for relevant statutes, case law, and legal principles."""
-    query_words = set(query.lower().split())
+    query_lower = query.lower()
+    query_words = set(re.findall(r"\w+", query_lower))
     scored = []
     for entry in LEGAL_KNOWLEDGE:
-        overlap = len(query_words & set(entry["keywords"]))
-        if overlap > 0:
-            scored.append((overlap, entry))
+        score = 0
+        for keyword in entry["keywords"]:
+            keyword_lower = keyword.lower()
+            keyword_words = set(re.findall(r"\w+", keyword_lower))
+
+            if keyword_lower in query_lower:
+                score += 3
+            elif query_words & keyword_words:
+                score += len(query_words & keyword_words)
+
+        if score > 0:
+            scored.append((score, entry))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:2]
     if not top:
@@ -134,10 +156,70 @@ def calculate_damages(breach_type: str, contract_value: float) -> str:
         f"  Total estimated exposure: ${total:,.2f}"
     )
 
+@tool
+def check_statute_of_limitations(case_type: str) -> str:
+    """Kiểm tra thời hiệu khởi kiện theo loại vụ án.
 
-TOOLS = [search_legal_database, calculate_damages]
+    Args:
+        case_type: Loại vụ án (contract, tort, property)
+    """
+    limits = {
+        "contract": "4 năm (UCC § 2-725)",
+        "tort": "2-3 năm tùy bang",
+        "property": "5 năm",
+    }
+    return limits.get(case_type.lower(), "Không xác định")
 
-QUESTION = "What are the legal consequences if a company breaches a non-disclosure agreement?"
+
+
+TOOLS = [search_legal_database, calculate_damages, check_statute_of_limitations]
+
+# QUESTION = "What are the legal consequences if a company breaches a non-disclosure agreement?"
+# QUESTION = "Người sử dụng lao động có được sa thải nhân viên ngay không?"
+QUESTION = "What is the statute of limitations for a contract breach and what damages might apply?"
+
+
+def build_fallback_tool_calls(question: str) -> list[dict]:
+    """Best-effort fallback when the model's tool calling fails."""
+    question_lower = question.lower()
+    calls = []
+
+    calls.append(
+        {
+            "id": "fallback-search",
+            "name": "search_legal_database",
+            "args": {"query": question},
+        }
+    )
+
+    if "statute of limitations" in question_lower or "thời hiệu" in question_lower:
+        case_type = "contract"
+        if "tort" in question_lower:
+            case_type = "tort"
+        elif "property" in question_lower:
+            case_type = "property"
+
+        calls.append(
+            {
+                "id": "fallback-limitations",
+                "name": "check_statute_of_limitations",
+                "args": {"case_type": case_type},
+            }
+        )
+
+    if "damages" in question_lower:
+        calls.append(
+            {
+                "id": "fallback-damages",
+                "name": "calculate_damages",
+                "args": {
+                    "breach_type": "standard contract breach",
+                    "contract_value": 100000.0,
+                },
+            }
+        )
+
+    return calls
 
 
 async def main():
@@ -155,7 +237,9 @@ async def main():
     print("-" * 70)
 
     llm = get_llm()
-    llm_with_tools = llm.bind_tools(TOOLS)
+    # llm_with_tools = llm.bind_tools(TOOLS)
+    llm_with_tools = llm.bind_tools(TOOLS, tool_choice="required")
+
     tool_map = {t.name: t for t in TOOLS}
 
     messages = [
@@ -172,17 +256,25 @@ async def main():
 
     # --- Step 1: LLM decides which tools to call ---
     print("\n>>> Step 1: Asking LLM (with tools bound)...\n")
-    response = await llm_with_tools.ainvoke(messages)
-    messages.append(response)
+    response = None
+    try:
+        response = await llm_with_tools.ainvoke(messages)
+        messages.append(response)
+        tool_calls = response.tool_calls
+    except Exception as exc:
+        print(f"LLM tool-calling failed: {exc}")
+        print("Falling back to a deterministic tool-selection path for the lab.\n")
+        tool_calls = build_fallback_tool_calls(QUESTION)
 
-    if not response.tool_calls:
+    if not tool_calls:
         print("LLM chose not to use any tools. Direct answer:")
-        print(response.content)
+        if response is not None:
+            print(response.content)
         return
 
     # --- Step 2: Execute tool calls ---
-    print(f">>> Step 2: LLM requested {len(response.tool_calls)} tool call(s):\n")
-    for tc in response.tool_calls:
+    print(f">>> Step 2: LLM requested {len(tool_calls)} tool call(s):\n")
+    for tc in tool_calls:
         print(f"  Tool: {tc['name']}")
         print(f"  Args: {tc['args']}")
 
@@ -195,8 +287,27 @@ async def main():
 
     # --- Step 3: LLM generates final grounded answer ---
     print(">>> Step 3: LLM generating final answer with tool results...\n")
-    final_response = await llm_with_tools.ainvoke(messages)
-    print(final_response.content)
+    tool_results = [
+        msg.content for msg in messages if isinstance(msg, ToolMessage)
+    ]
+    final_messages = [
+        SystemMessage(
+            content=(
+                "You are a legal expert. Write a final answer grounded only in the tool results "
+                "provided. Answer in the same language as the user's question. "
+                "Be specific, concise, and practical."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"User question:\n{QUESTION}\n\n"
+                f"Tool results:\n{chr(10).join(tool_results)}\n\n"
+                "Now provide the final answer."
+            )
+        ),
+    ]
+    final_response = await llm.ainvoke(final_messages)
+    print(f"Final Response: {final_response.content}")
 
     print()
     print("-" * 70)

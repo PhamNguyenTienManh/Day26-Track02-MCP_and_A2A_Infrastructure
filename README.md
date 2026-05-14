@@ -132,6 +132,13 @@ cp .env.example .env
 uv run python test_client.py
 ```
 
+On Windows / PowerShell, use the PowerShell launcher instead:
+
+```powershell
+.\start_all.ps1
+uv run python test_client.py
+```
+
 ### Run Individual Stage Demos
 
 No servers needed — each demo runs as a standalone script:
